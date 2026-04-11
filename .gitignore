@@ -1,0 +1,55 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.docker.example
+!backend/.env.example
+!frontend/.env.example
+.envrc
+secrets/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.python-version
+.venv/
+venv/
+env/
+backend/venv/
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# Node / Next.js
+node_modules/
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+.pnpm-store/
+
+# Logs and runtime files
+*.log
+logs/
+mtr_poller.log
+*.pid
+*.pid.lock
+
+# Docker / scan artifacts
+.trivy/
+trivy*.txt
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
