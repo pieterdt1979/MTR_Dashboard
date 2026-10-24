@@ -1,0 +1,39 @@
+# Next.js frontend on UBI9 Node.js. Build context = repository root.
+# Node 22 is used (not 20) because frontend/package.json declares "engines": {"node": ">=22.0.0"}.
+# Override with --build-arg NODE_STREAM=20 if your registry policy requires it.
+ARG NODE_STREAM=22
+
+FROM registry.access.redhat.com/ubi9/nodejs-${NODE_STREAM}:latest AS builder
+USER 1001
+WORKDIR /opt/app-root/src
+
+COPY --chown=1001:0 frontend/package.json frontend/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+
+COPY --chown=1001:0 frontend/ ./
+# The repo's next.config.ts does not set output:"standalone"; inject it at build time
+# (repo file untouched) and fail fast if the standalone bundle is not produced.
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN rm -f .env .env.local \
+ && if ! grep -q 'output:' next.config.ts; then \
+      sed -i 's/const nextConfig: NextConfig = {/const nextConfig: NextConfig = {\n  output: "standalone",/' next.config.ts; \
+    fi \
+ && grep -q 'output: "standalone"' next.config.ts \
+ && npm run build \
+ && test -f .next/standalone/server.js
+
+FROM registry.access.redhat.com/ubi9/nodejs-${NODE_STREAM}-minimal:latest AS runtime
+USER 1001
+WORKDIR /opt/app-root/src
+ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
+
+COPY --from=builder --chown=1001:0 /opt/app-root/src/.next/standalone ./
+COPY --from=builder --chown=1001:0 /opt/app-root/src/.next/static ./.next/static
+COPY --from=builder --chown=1001:0 /opt/app-root/src/public ./public
+COPY --from=builder --chown=1001:0 /opt/app-root/src/scripts ./scripts
+COPY --chown=1001:0 infrastructure/frontend/entrypoint.sh /opt/app-root/entrypoint.sh
+
+USER 1001
+# Host networking: server.js binds ${HOSTNAME}:${PORT} directly; nothing is EXPOSEd/published.
+ENTRYPOINT ["/bin/sh", "/opt/app-root/entrypoint.sh"]
+CMD ["node", "server.js"]

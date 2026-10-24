@@ -1,0 +1,37 @@
+# ClickHouse on UBI9 using the official ClickHouse RPM repository.
+# Runs as the 'clickhouse' account pinned to UID/GID 1001 (project-wide non-root UID).
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+# Leave empty for the latest stable release, or pin e.g. CLICKHOUSE_VERSION=25.8.2.29
+ARG CLICKHOUSE_VERSION=""
+ARG CLICKHOUSE_CHANNEL=stable
+
+# Pre-create the service account so the RPM scriptlets reuse UID/GID 1001.
+RUN groupadd -g 1001 clickhouse \
+ && useradd -u 1001 -g 1001 -r -M -d /var/lib/clickhouse -s /sbin/nologin clickhouse
+
+RUN printf '%s\n' \
+      "[clickhouse-${CLICKHOUSE_CHANNEL}]" \
+      "name=ClickHouse - ${CLICKHOUSE_CHANNEL}" \
+      "baseurl=https://packages.clickhouse.com/rpm/${CLICKHOUSE_CHANNEL}/" \
+      "gpgkey=https://packages.clickhouse.com/rpm/${CLICKHOUSE_CHANNEL}/repodata/repomd.xml.key" \
+      "gpgcheck=0" "repo_gpgcheck=1" "enabled=1" > /etc/yum.repos.d/clickhouse.repo \
+ && if [ -n "${CLICKHOUSE_VERSION}" ]; then \
+      dnf -y install clickhouse-server-${CLICKHOUSE_VERSION} clickhouse-client-${CLICKHOUSE_VERSION} clickhouse-common-static-${CLICKHOUSE_VERSION}; \
+    else \
+      dnf -y install clickhouse-server clickhouse-client; \
+    fi \
+ && dnf clean all && rm -rf /var/cache/dnf \
+ && mkdir -p /var/lib/clickhouse /var/log/clickhouse-server /docker-entrypoint-initdb.d \
+ && chown -R 1001:1001 /var/lib/clickhouse /var/log/clickhouse-server /etc/clickhouse-server /docker-entrypoint-initdb.d
+
+# Host-networking listeners (0.0.0.0:8123 HTTP, 0.0.0.0:9000 native) + env-driven auth.
+COPY --chown=1001:1001 infrastructure/clickhouse/config.d/ /etc/clickhouse-server/config.d/
+COPY --chown=1001:1001 infrastructure/clickhouse/users.d/  /etc/clickhouse-server/users.d/
+COPY --chown=1001:1001 infrastructure/clickhouse/*.sql     /docker-entrypoint-initdb.d/
+COPY --chown=1001:1001 infrastructure/clickhouse/entrypoint.sh /usr/local/bin/ch-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/ch-entrypoint.sh
+
+USER 1001
+VOLUME ["/var/lib/clickhouse"]
+ENTRYPOINT ["/usr/local/bin/ch-entrypoint.sh"]

@@ -1,0 +1,30 @@
+# MTR backend poller on UBI9 Python 3.11 (image name: ubi9/python-311).
+# Build context = repository root (this infrastructure/ dir sits next to backend/ and frontend/).
+FROM registry.access.redhat.com/ubi9/python-311:latest
+
+USER 0
+# mtr: UBI9 BaseOS. fping: EPEL 9 (not shipped in UBI repos).
+# File capabilities let the non-root UID 1001 open raw ICMP sockets when the container
+# is granted NET_RAW (see podman-compose.yml).
+RUN dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm \
+ && dnf -y install mtr fping iputils libcap \
+ && dnf clean all && rm -rf /var/cache/dnf \
+ && setcap cap_net_raw+ep "$(command -v fping)" \
+ && setcap cap_net_raw+ep "$(command -v mtr-packet)"
+
+WORKDIR /opt/app-root/src
+COPY --chown=1001:0 backend/requirements.txt ./requirements.txt
+COPY --chown=1001:0 infrastructure/backend/requirements-phase1.txt ./requirements-phase1.txt
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt -r requirements-phase1.txt
+
+COPY --chown=1001:0 backend/ ./
+COPY --chown=1001:0 infrastructure/backend/entrypoint.sh /usr/local/bin/backend-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/backend-entrypoint.sh \
+ && rm -f .env \
+ && chmod -R g=u /opt/app-root/src
+
+USER 1001
+ENV PYTHONUNBUFFERED=1
+ENTRYPOINT ["/usr/local/bin/backend-entrypoint.sh"]
+CMD ["python", "mtr_poller.py"]

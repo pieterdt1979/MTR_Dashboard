@@ -1,0 +1,30 @@
+# PostgreSQL 16 on UBI9 (PGDG RHEL9 RPMs). Runs as UID 1001, host networking.
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+ARG PG_MAJOR=16
+ENV PG_MAJOR=${PG_MAJOR} \
+    PGDATA=/var/lib/pgsql/data \
+    PATH=/usr/pgsql-16/bin:$PATH
+
+# Pre-create the postgres account with UID/GID 1001 so the PGDG RPM %pre
+# scriptlet reuses it instead of allocating UID 26.
+RUN groupadd -g 1001 postgres \
+ && useradd -u 1001 -g 1001 -d /var/lib/pgsql -m -s /bin/bash postgres
+
+RUN dnf -y install https://download.postgresql.org/pub/repos/yum/reporpms/EL-9-x86_64/pgdg-redhat-repo-latest.noarch.rpm \
+ && (dnf -qy module disable postgresql || true) \
+ && dnf -y install postgresql${PG_MAJOR}-server postgresql${PG_MAJOR}-contrib \
+ && dnf clean all && rm -rf /var/cache/dnf \
+ && mkdir -p ${PGDATA} /var/run/postgresql /docker-entrypoint-initdb.d \
+ && chown -R 1001:1001 /var/lib/pgsql /var/run/postgresql /docker-entrypoint-initdb.d \
+ && chmod 0700 ${PGDATA}
+
+COPY --chown=1001:1001 infrastructure/postgres/entrypoint.sh /usr/local/bin/pg-entrypoint.sh
+COPY --chown=1001:1001 infrastructure/postgres/*.sql /docker-entrypoint-initdb.d/
+RUN chmod 0755 /usr/local/bin/pg-entrypoint.sh
+
+USER 1001
+VOLUME ["/var/lib/pgsql/data"]
+# No EXPOSE: the container uses host networking and binds ${POSTGRES_PORT} directly.
+ENTRYPOINT ["/usr/local/bin/pg-entrypoint.sh"]
+CMD ["postgres"]

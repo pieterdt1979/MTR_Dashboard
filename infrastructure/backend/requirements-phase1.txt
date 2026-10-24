@@ -1,0 +1,5 @@
+# Phase 1 additions layered on top of backend/requirements.txt (repo file left untouched).
+clickhouse-driver==0.2.9
+redis==5.2.1
+psycopg2-binary==2.9.10
+cryptography==44.0.2

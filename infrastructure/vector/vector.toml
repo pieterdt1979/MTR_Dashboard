@@ -1,0 +1,204 @@
+# =============================================================================
+# Vector — syslog + NetFlow pre-processor for MTR Dashboard Phase 1
+# Host networking: binds 0.0.0.0 directly. Secrets/ports come from the environment
+# (env interpolation is enabled explicitly via --dangerously-allow-env-var-interpolation,
+#  required since Vector 0.5x; only our own container env is interpolated).
+# =============================================================================
+data_dir = "/var/lib/vector"
+
+[api]
+enabled = true
+address = "127.0.0.1:8686"   # /health used by the podman-compose healthcheck
+
+# -----------------------------------------------------------------------------
+# Sources
+# -----------------------------------------------------------------------------
+[sources.syslog_udp]
+type = "socket"
+mode = "udp"
+address = "0.0.0.0:${SYSLOG_PORT:-514}"
+max_length = 65535
+host_key = "host"
+
+[sources.syslog_tcp]
+type = "socket"
+mode = "tcp"
+address = "0.0.0.0:${SYSLOG_PORT:-514}"
+host_key = "host"
+connection_limit = 2048
+
+# goflow2 JSON records, rotated into flows-<ns>.json on the shared spool volume.
+# Only rotated (closed) files are read; they are deleted once fully consumed.
+[sources.goflow2_spool]
+type = "file"
+include = ["/var/spool/goflow2/flows-*.json"]
+read_from = "beginning"
+remove_after_secs = 30
+glob_minimum_cooldown_ms = 1000
+
+# -----------------------------------------------------------------------------
+# Syslog parsing (RFC3164 + RFC5424 + Cisco/Huawei mnemonics)
+# -----------------------------------------------------------------------------
+[transforms.parse_syslog]
+type = "remap"
+inputs = ["syslog_udp", "syslog_tcp"]
+drop_on_error = false
+source = '''
+raw = strip_whitespace(to_string(.message) ?? "")
+peer = to_string(.host) ?? "0.0.0.0"
+# Strip any ":port" suffix and keep only valid IPv4 peers (ClickHouse column is IPv4).
+peer = replace(peer, r':\d+$', "")
+if !is_ipv4(peer) { peer = "0.0.0.0" }
+
+# PRI -> facility/severity (RFC3164 & RFC5424 share the <PRI> header).
+facility = 1    # user-level default when no PRI present
+severity = 5    # notice default
+pri_match, pri_err = parse_regex(raw, r'^<(?P<pri>\d{1,3})>')
+has_pri = pri_err == null
+if has_pri {
+  pri = to_int(pri_match.pri) ?? 13
+  severity = mod(pri, 8)
+  facility = to_int(floor((pri - severity) / 8))
+}
+
+host = ""
+program = ""
+event_ts = now()
+parsed, perr = parse_syslog(raw)
+if perr == null {
+  host = to_string(parsed.hostname)
+  program = to_string(parsed.appname)
+  ts = parsed.timestamp
+  if is_timestamp(ts) {
+    # Trust the device clock only within +/- 24h (many routers have unsynced clocks).
+    drift = to_unix_timestamp(now()) - to_unix_timestamp!(ts)
+    if drift < 86400 && drift > -86400 { event_ts = ts }
+  }
+}
+
+# RFC3164 parsers treat a leading "%MNEMONIC" token as the app name; discard it.
+if starts_with(program, "%") { program = "" }
+
+# Cisco IOS/IOS-XE/IOS-XR:  %BGP-5-ADJCHANGE: ...   (XR: %ROUTING-BGP-5-ADJCHANGE)
+# Huawei VRP:              %%01BGP/3/STATE_CHG_UPDOWN(l): ...
+mnemonic = ""
+cisco, cerr = parse_regex(raw, r'%(?P<facility>[A-Z][A-Z0-9_]*(?:-[A-Z][A-Z0-9_]*)*)-(?P<sev>[0-7])-(?P<mn>[A-Z0-9_]+)')
+if cerr == null {
+  mnemonic = to_string(cisco.facility) + "-" + to_string(cisco.sev) + "-" + to_string(cisco.mn)
+  if program == "" { program = to_string(cisco.facility) }
+  if !has_pri { severity = to_int(cisco.sev) ?? severity }
+} else {
+  huawei, herr = parse_regex(raw, r'%%(?:\d{2})?(?P<module>[A-Z][A-Z0-9_]*)/(?P<sev>[0-7])/(?P<mn>[A-Z0-9_]+)')
+  if herr == null {
+    mnemonic = to_string(huawei.module) + "/" + to_string(huawei.sev) + "/" + to_string(huawei.mn)
+    if program == "" { program = to_string(huawei.module) }
+    if !has_pri { severity = to_int(huawei.sev) ?? severity }
+  }
+}
+if host == "" { host = peer }
+
+. = {
+  "event_time":     format_timestamp!(event_ts, format: "%Y-%m-%d %H:%M:%S", timezone: "UTC"),
+  "device_id":      0,      # placeholder — async enrichment maps source_ip -> devices.id
+  "source_ip":      peer,
+  "facility":       facility,
+  "severity":       severity,
+  "mnemonic":       mnemonic,
+  "raw_message":    raw,
+  "parsed_host":    host,
+  "parsed_program": program
+}
+'''
+
+# -----------------------------------------------------------------------------
+# goflow2 JSON -> netflow_records
+# -----------------------------------------------------------------------------
+[transforms.parse_flows]
+type = "remap"
+inputs = ["goflow2_spool"]
+drop_on_error = true
+drop_on_abort = true
+source = '''
+f = parse_json!(.message)
+if !is_object(f) { abort }
+# IPv4-only table: IPv6 flows are dropped here (add a netflow_records_v6 table if needed).
+if f.etype != "IPv4" { abort }
+
+proto_names = {"ICMP": 1, "IGMP": 2, "TCP": 6, "UDP": 17, "GRE": 47, "ESP": 50, "AH": 51,
+               "ICMPv6": 58, "IPv6-ICMP": 58, "EIGRP": 88, "OSPF": 89, "PIM": 103, "VRRP": 112, "SCTP": 132}
+p = f.proto
+proto = 0
+if is_integer(p) {
+  proto = p
+} else {
+  proto = to_int(get(proto_names, [to_string(p) ?? ""]) ?? 0) ?? 0
+}
+
+rate = to_int(f.sampling_rate) ?? 0
+if rate < 1 { rate = 1 }
+
+start_ns = to_int(f.time_flow_start_ns) ?? 0
+end_ns   = to_int(f.time_flow_end_ns) ?? 0
+if start_ns <= 0 { start_ns = to_int(f.time_received_ns) ?? to_unix_timestamp(now(), unit: "nanoseconds") }
+if end_ns   <= 0 { end_ns = start_ns }
+
+exporter = to_string(f.sampler_address) ?? "0.0.0.0"
+if !is_ipv4(exporter) { exporter = "0.0.0.0" }
+
+. = {
+  "flow_start":     format_timestamp!(from_unix_timestamp!(start_ns, unit: "nanoseconds"), format: "%Y-%m-%d %H:%M:%S", timezone: "UTC"),
+  "flow_end":       format_timestamp!(from_unix_timestamp!(end_ns,   unit: "nanoseconds"), format: "%Y-%m-%d %H:%M:%S", timezone: "UTC"),
+  "exporter_ip":    exporter,
+  "device_id":      0,       # placeholder — async enrichment maps exporter_ip -> devices.id
+  "input_ifindex":  to_int(f.in_if) ?? 0,
+  "output_ifindex": to_int(f.out_if) ?? 0,
+  "src_ip":         to_string(f.src_addr) ?? "0.0.0.0",
+  "dst_ip":         to_string(f.dst_addr) ?? "0.0.0.0",
+  "src_port":       to_int(f.src_port) ?? 0,
+  "dst_port":       to_int(f.dst_port) ?? 0,
+  "protocol":       proto,
+  "bytes":          (to_int(f.bytes) ?? 0) * rate,
+  "packets":        (to_int(f.packets) ?? 0) * rate,
+  "input_ifname":   "",
+  "output_ifname":  ""
+}
+'''
+
+# -----------------------------------------------------------------------------
+# Sinks — ClickHouse HTTP interface on localhost (host networking)
+# -----------------------------------------------------------------------------
+[sinks.clickhouse_syslog]
+type = "clickhouse"
+inputs = ["parse_syslog"]
+endpoint = "http://localhost:${CLICKHOUSE_HTTP_PORT:-8123}"
+database = "${CLICKHOUSE_DB:-mtr}"
+table = "syslog_events"
+skip_unknown_fields = true
+date_time_best_effort = true
+compression = "gzip"
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-default}"
+auth.password = "${CLICKHOUSE_PASSWORD}"
+batch.max_events = 5000
+batch.timeout_secs = 2
+buffer.type = "disk"
+buffer.max_size = 1073741824   # 1 GiB on-disk buffer survives ClickHouse restarts
+buffer.when_full = "block"
+
+[sinks.clickhouse_netflow]
+type = "clickhouse"
+inputs = ["parse_flows"]
+endpoint = "http://localhost:${CLICKHOUSE_HTTP_PORT:-8123}"
+database = "${CLICKHOUSE_DB:-mtr}"
+table = "netflow_records"
+skip_unknown_fields = true
+date_time_best_effort = true
+compression = "gzip"
+auth.strategy = "basic"
+auth.user = "${CLICKHOUSE_USER:-default}"
+auth.password = "${CLICKHOUSE_PASSWORD}"
+batch.max_events = 20000
+batch.timeout_secs = 2
+buffer.type = "disk"
+buffer.max_size = 2147483648
+buffer.when_full = "block"

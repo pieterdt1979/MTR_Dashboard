@@ -1,0 +1,10 @@
+<clickhouse>
+    <users>
+        <!-- The password is read from the CLICKHOUSE_PASSWORD environment variable at
+             server start; it is never stored in the image or the repository. -->
+        <default>
+            <password from_env="CLICKHOUSE_PASSWORD"/>
+            <access_management>1</access_management>
+        </default>
+    </users>
+</clickhouse>

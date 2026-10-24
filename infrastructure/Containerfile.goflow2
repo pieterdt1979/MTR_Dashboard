@@ -1,0 +1,27 @@
+# goflow2 (NetFlow v5/v9, IPFIX, Huawei NetStream, sFlow) — built from source.
+# Builder is the UBI9 Go toolset (not golang:1.22) so EVERY stage stays on UBI9; goflow2 v2.2.x
+# requires Go >= 1.23, so GOTOOLCHAIN=auto lets the toolset fetch the exact toolchain from go.mod.
+FROM registry.access.redhat.com/ubi9/go-toolset:latest AS builder
+
+ARG GOFLOW2_VERSION=v2.2.7
+ENV CGO_ENABLED=0 GOTOOLCHAIN=auto GOFLAGS=-trimpath
+
+WORKDIR /opt/app-root/src
+RUN git clone --depth 1 --branch "${GOFLOW2_VERSION}" https://github.com/netsampler/goflow2.git . \
+ && go build -ldflags "-s -w -X main.version=${GOFLOW2_VERSION}" -o /opt/app-root/goflow2 ./cmd/goflow2 \
+ && /opt/app-root/goflow2 -v
+
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest AS runtime
+
+RUN microdnf -y install shadow-utils && microdnf clean all \
+ && groupadd -g 1001 goflow && useradd -u 1001 -g 1001 -M -d /var/spool/goflow2 -s /sbin/nologin goflow \
+ && mkdir -p /var/spool/goflow2 && chown 1001:1001 /var/spool/goflow2
+
+COPY --from=builder /opt/app-root/goflow2 /usr/local/bin/goflow2
+COPY --chown=1001:1001 infrastructure/goflow2/entrypoint.sh /usr/local/bin/goflow2-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/goflow2-entrypoint.sh
+
+USER 1001
+# Listens on 0.0.0.0:${GOFLOW2_NETFLOW_PORT:-2055}/udp (host networking). JSON flow records are
+# written to /var/spool/goflow2 (shared volume) and tailed by the Vector container.
+ENTRYPOINT ["/usr/local/bin/goflow2-entrypoint.sh"]

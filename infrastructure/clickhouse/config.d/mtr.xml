@@ -1,0 +1,21 @@
+<clickhouse>
+    <!-- Host networking: bind directly on all IPv4 interfaces. -->
+    <listen_host>0.0.0.0</listen_host>
+    <http_port replace="replace" from_env="CLICKHOUSE_HTTP_PORT"/>   <!-- entrypoint exports, default 8123 -->
+    <tcp_port replace="replace" from_env="CLICKHOUSE_PORT"/>         <!-- entrypoint exports, default 9000 -->
+
+    <!-- Disable listeners we do not use to avoid host port clashes. -->
+    <interserver_http_port remove="1"/>
+    <mysql_port remove="1"/>
+    <postgresql_port remove="1"/>
+
+    <!-- Log to stdout/stderr so `podman logs` works. -->
+    <logger>
+        <level>information</level>
+        <console>1</console>
+        <log remove="1"/>
+        <errorlog remove="1"/>
+    </logger>
+
+    <max_server_memory_usage_to_ram_ratio>0.75</max_server_memory_usage_to_ram_ratio>
+</clickhouse>

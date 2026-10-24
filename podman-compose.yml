@@ -1,0 +1,324 @@
+# =============================================================================
+# MTR Dashboard / ConnectedInsight — Phase 1 stack (Podman Compose)
+#
+#   * Every image is built FROM Red Hat UBI9 (ubi / ubi-minimal / python-311 / nodejs-22).
+#   * Every container uses host networking (network_mode: host -> podman --network=host).
+#     No bridge networks and no `ports:` mappings: services bind 0.0.0.0:<port> directly.
+#   * Every container runs as UID 1001 (non-root).
+#   * Secrets are interpolated from ./.env (copy .env.example). Nothing is hard-coded.
+#
+# Place this file (and infrastructure/) at the repository root, next to backend/ and frontend/.
+#   cp .env.example .env && $EDITOR .env
+#   sudo podman-compose up -d --build      # rootful recommended: syslog 514/udp + raw ICMP (see README)
+# Requires podman >= 4.4 and podman-compose >= 1.2 (depends_on: condition: service_healthy).
+# =============================================================================
+name: mtr
+
+x-common: &common
+  network_mode: host
+  restart: unless-stopped
+  user: "1001"
+  logging:
+    driver: k8s-file
+    options:
+      max-size: 20mb
+
+services:
+  # ---------------------------------------------------------------------------
+  postgres16:
+    <<: *common
+    image: localhost/mtr/postgres16:phase1
+    container_name: mtr-postgres16
+    build:
+      context: .
+      dockerfile: infrastructure/Containerfile.postgres
+    environment:
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-mtr_dashboard}
+      POSTGRES_USER: ${POSTGRES_USER:-mtr_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/pgsql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p ${POSTGRES_PORT:-5432} -U ${POSTGRES_USER:-mtr_app} -d ${POSTGRES_DB:-mtr_dashboard}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    <<: *common
+    image: localhost/mtr/clickhouse:phase1
+    container_name: mtr-clickhouse
+    build:
+      context: .
+      dockerfile: infrastructure/Containerfile.clickhouse
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-mtr}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-9000}
+      CLICKHOUSE_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}/ping | grep -q Ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  redis:
+    <<: *common
+    image: localhost/mtr/redis:phase1
+    container_name: mtr-redis
+    build:
+      context: .
+      dockerfile: infrastructure/Containerfile.redis
+    environment:
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_BIND: ${REDIS_BIND:-0.0.0.0}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/var/lib/redis
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -h 127.0.0.1 -p ${REDIS_PORT:-6379} ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  vector-syslog:
+    <<: *common
+    image: localhost/mtr/vector:phase1
+    container_name: mtr-vector-syslog
+    build:
+      context: .
+      dockerfile: infrastructure/Containerfile.vector
+    # Vector >= 0.5x requires explicit opt-in for ${VAR} interpolation in vector.toml.
+    command: ["--config", "/etc/vector/vector.toml", "--dangerously-allow-env-var-interpolation"]
+    environment:
+      SYSLOG_PORT: ${SYSLOG_PORT:-514}
+      CLICKHOUSE_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-mtr}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      VECTOR_LOG: ${VECTOR_LOG:-info}
+    volumes:
+      - vector_data:/var/lib/vector
+      - flow_spool:/var/spool/goflow2
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/8686'"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  goflow2:
+    <<: *common
+    image: localhost/mtr/goflow2:phase1
+    container_name: mtr-goflow2
+    build:
+      context: .
+      dockerfile: infrastructure/Containerfile.goflow2
+    environment:
+      GOFLOW2_NETFLOW_PORT: ${GOFLOW2_NETFLOW_PORT:-2055}
+      GOFLOW2_SFLOW_PORT: ${GOFLOW2_SFLOW_PORT:-6343}
+      GOFLOW2_METRICS_ADDR: ${GOFLOW2_METRICS_ADDR:-127.0.0.1:8081}
+      GOFLOW2_ROTATE_SECS: ${GOFLOW2_ROTATE_SECS:-15}
+    volumes:
+      - flow_spool:/var/spool/goflow2
+    depends_on:
+      vector-syslog:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c \"</dev/tcp/$${GOFLOW2_METRICS_ADDR%:*}/$${GOFLOW2_METRICS_ADDR##*:}\""]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  # ---------------------------------------------------------------------------
+  mtr-backend:
+    <<: *common
+    image: localhost/mtr/backend:phase1
+    container_name: mtr-backend
+    build:
+      context: .
+      dockerfile: infrastructure/Containerfile.backend
+    cap_add:
+      - NET_RAW          # fping / mtr-packet raw ICMP (file caps set in the image)
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST:-localhost}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-mtr_dashboard}
+      POSTGRES_USER: ${POSTGRES_USER:-mtr_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_STATE_TABLE: device_probe_state
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-localhost}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-9000}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-mtr}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      REDIS_HOST: ${REDIS_HOST:-localhost}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      MTR_POLL_INTERVAL: ${MTR_POLL_INTERVAL:-300}
+      MTR_BURST_INTERVAL: ${MTR_BURST_INTERVAL:-30}
+      MTR_BURST_MAX_HOURS: ${MTR_BURST_MAX_HOURS:-8}
+      MTR_CREDENTIAL_KEY: ${MTR_CREDENTIAL_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Legacy (pre-Phase-2) stores still read by the current mtr_poller.py — optional.
+      MYSQL_HOST: ${MYSQL_HOST:-}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-}
+      MONGODB_URI: ${MONGODB_URI:-}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-}
+    depends_on:
+      postgres16:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Poller writes its log on every cycle; unhealthy if silent for 3 poll intervals.
+      test: ["CMD-SHELL", "f=/opt/app-root/src/mtr_poller.log; test -f $$f && test $$(( $$(date +%s) - $$(stat -c %Y $$f) )) -lt $$(( $${MTR_POLL_INTERVAL:-300} * 3 ))"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # Phase 2 — FastAPI (/api/v2) + async SNMP poller + burst manager.
+  # Source lives in backend_v2/ (the legacy backend/ with mtr_poller.py is untouched);
+  # the Containerfile installs it in the image as the Python package `backend`.
+  mtr-api:
+    <<: *common
+    image: localhost/mtr/api:phase2
+    container_name: mtr-api
+    build:
+      context: .
+      dockerfile: backend_v2/Containerfile
+    environment:
+      MTR_API_HOST: 0.0.0.0
+      MTR_API_PORT: ${MTR_API_PORT:-8000}
+      MTR_API_WORKERS: ${MTR_API_WORKERS:-4}
+      MTR_API_SHARED_SECRET: ${MTR_API_SHARED_SECRET:?set MTR_API_SHARED_SECRET in .env}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+      POSTGRES_HOST: ${POSTGRES_HOST:-localhost}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-mtr_dashboard}
+      POSTGRES_USER: ${POSTGRES_USER:-mtr_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      MTR_APPLY_MIGRATIONS: ${MTR_APPLY_MIGRATIONS:-true}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-localhost}
+      CLICKHOUSE_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-mtr}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      REDIS_HOST: ${REDIS_HOST:-localhost}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SNMP_POLLER_ENABLED: ${SNMP_POLLER_ENABLED:-true}
+      SNMP_TIMEOUT: ${SNMP_TIMEOUT:-3}
+      SNMP_RETRIES: ${SNMP_RETRIES:-1}
+      SNMP_CONCURRENCY: ${SNMP_CONCURRENCY:-50}
+      MTR_POLL_INTERVAL: ${MTR_POLL_INTERVAL:-300}
+      MTR_BURST_INTERVAL: ${MTR_BURST_INTERVAL:-30}
+      MTR_BURST_MAX_HOURS: ${MTR_BURST_MAX_HOURS:-8}
+      MTR_CREDENTIAL_KEY: ${MTR_CREDENTIAL_KEY:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      postgres16:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('MTR_API_PORT','8000')+'/health',timeout=4).status==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  # ---------------------------------------------------------------------------
+  mtr-frontend:
+    <<: *common
+    image: localhost/mtr/frontend:phase1
+    container_name: mtr-frontend
+    build:
+      context: .
+      dockerfile: infrastructure/Containerfile.frontend
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: ${FRONTEND_PORT:-3000}
+      POSTGRES_HOST: ${POSTGRES_HOST:-localhost}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_DB: ${POSTGRES_DB:-mtr_dashboard}
+      POSTGRES_USER: ${POSTGRES_USER:-mtr_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-localhost}
+      CLICKHOUSE_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT:-8123}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-mtr}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in .env}
+      REDIS_HOST: ${REDIS_HOST:-localhost}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SECURITY_ENFORCE_AUTH: ${SECURITY_ENFORCE_AUTH:-true}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env}
+      SESSION_DURATION_HOURS: ${SESSION_DURATION_HOURS:-12}
+      AUTH_ADMIN_USERNAME: ${AUTH_ADMIN_USERNAME:-admin}
+      AUTH_ADMIN_PASSWORD: ${AUTH_ADMIN_PASSWORD:-}
+      AUTH_OPERATOR_USERNAME: ${AUTH_OPERATOR_USERNAME:-operator}
+      AUTH_OPERATOR_PASSWORD: ${AUTH_OPERATOR_PASSWORD:-}
+      AUTH_VIEWER_USERNAME: ${AUTH_VIEWER_USERNAME:-viewer}
+      AUTH_VIEWER_PASSWORD: ${AUTH_VIEWER_PASSWORD:-}
+      # Phase 2: /api/v2/* proxy -> FastAPI (mtr-api). Same shared secret on both sides.
+      BACKEND_URL: ${BACKEND_URL:-http://localhost:8000}
+      MTR_API_SHARED_SECRET: ${MTR_API_SHARED_SECRET:?set MTR_API_SHARED_SECRET in .env}
+      # Legacy (pre-Phase-2) stores still read by the current frontend API routes — optional.
+      MYSQL_HOST: ${MYSQL_HOST:-}
+      MYSQL_PORT: ${MYSQL_PORT:-3306}
+      MYSQL_USER: ${MYSQL_USER:-}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-}
+      MONGODB_URI: ${MONGODB_URI:-}
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-}
+    depends_on:
+      postgres16:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      mtr-backend:
+        condition: service_started
+      mtr-api:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  redis_data:
+  vector_data:
+  flow_spool:

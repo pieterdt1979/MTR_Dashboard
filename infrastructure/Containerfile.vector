@@ -1,0 +1,27 @@
+# Vector (syslog + NetFlow pre-processor) on UBI9-minimal using the official Vector RPM repo.
+FROM registry.access.redhat.com/ubi9/ubi-minimal:latest
+
+ARG VECTOR_VERSION=0.60.0
+
+RUN printf '%s\n' \
+      "[vector]" \
+      "name=Vector" \
+      "baseurl=https://yum.vector.dev/stable/vector-0/\$basearch/" \
+      "enabled=1" "gpgcheck=1" "repo_gpgcheck=1" \
+      "gpgkey=https://keys.datadoghq.com/DATADOG_RPM_KEY_CURRENT.public" \
+      "       https://keys.datadoghq.com/DATADOG_RPM_KEY_B01082D3.public" > /etc/yum.repos.d/vector.repo \
+ && microdnf -y install vector-${VECTOR_VERSION} shadow-utils libcap \
+ && microdnf clean all \
+ && setcap cap_net_bind_service=+ep /usr/bin/vector \
+ && (getent group 1001 >/dev/null || groupadd -g 1001 mtr) \
+ && (getent passwd 1001 >/dev/null || useradd -u 1001 -g 1001 -M -d /var/lib/vector -s /sbin/nologin mtr) \
+ && mkdir -p /var/lib/vector /var/spool/goflow2 /etc/vector \
+ && chown -R 1001:1001 /var/lib/vector /var/spool/goflow2 /etc/vector
+
+COPY --chown=1001:1001 infrastructure/vector/vector.toml /etc/vector/vector.toml
+
+USER 1001
+# Syslog on 0.0.0.0:${SYSLOG_PORT:-514} (UDP+TCP) via host networking. Binding <1024 needs a
+# rootful Podman run (file capability cap_net_bind_service is set on the binary) — see README.
+ENTRYPOINT ["/usr/bin/vector"]
+CMD ["--config", "/etc/vector/vector.toml"]

@@ -1,0 +1,12 @@
+# MTR Phase 2 API + SNMP poller (installed into the mtr-api image).
+# The legacy poller's backend/requirements.txt in the repo is unchanged; this file is self-contained.
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+asyncpg==0.32.0
+clickhouse-connect[async]==1.11.0   # [async] pulls aiohttp for get_async_client()
+# pysnmp >= 7 IS the maintained LeXtudio line (asyncio-native hlapi.v3arch.asyncio).
+# The old "pysnmp-lextudio" package is deprecated and installs the same module name — do not add both.
+pysnmp==7.1.30
+redis[hiredis]==8.1.0               # redis.asyncio is built in; hiredis = faster parser
+python-dotenv==1.2.4
+cryptography==50.0.2                # AES-256-GCM decryption of snmp_credentials *_enc columns

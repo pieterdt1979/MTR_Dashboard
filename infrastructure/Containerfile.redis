@@ -1,0 +1,17 @@
+# Redis 7 on UBI9 (redis:7 module stream from the UBI9 AppStream repo).
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+RUN groupadd -g 1001 redis \
+ && useradd -u 1001 -g 1001 -r -M -d /var/lib/redis -s /sbin/nologin redis \
+ && (dnf -y module enable redis:7 || true) \
+ && dnf -y install redis \
+ && dnf clean all && rm -rf /var/cache/dnf \
+ && mkdir -p /var/lib/redis && chown -R 1001:1001 /var/lib/redis /etc/redis
+
+COPY --chown=1001:1001 infrastructure/redis/entrypoint.sh /usr/local/bin/redis-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/redis-entrypoint.sh
+
+USER 1001
+WORKDIR /var/lib/redis
+VOLUME ["/var/lib/redis"]
+ENTRYPOINT ["/usr/local/bin/redis-entrypoint.sh"]
